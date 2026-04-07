@@ -717,7 +717,7 @@ class Exporter:
         calibration_dataset, ignored_scope = None, None
         if self.args.int8:
             check_requirements("packaging>=23.2")  # must be installed first to build nncf wheel
-            check_requirements("nncf>=2.14.0,<3.0.0" if not TORCH_2_3 else "nncf>=2.14.0")
+            check_requirements("nncf>=2.14.0")
             import nncf
 
             calibration_dataset = nncf.Dataset(self.get_int8_calibration_dataloader(prefix), self._transform_fn)
@@ -1029,6 +1029,7 @@ class Exporter:
     def export_executorch(self, prefix=colorstr("ExecuTorch:")):
         """Export YOLO model to ExecuTorch *.pte format."""
         assert TORCH_2_9, f"ExecuTorch requires torch>=2.9.0 but torch=={TORCH_VERSION} is installed"
+
         check_executorch_requirements()
         from ultralytics.utils.export.executorch import torch2executorch
 

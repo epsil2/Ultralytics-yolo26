@@ -30,6 +30,13 @@ class DetectionPredictor(BasePredictor):
         >>> predictor.predict_cli()
     """
 
+    def _resolve_topk_cls(self) -> int:
+        """Return requested top-k class count from predictor state."""
+        topk_cls = getattr(self, "_topk_cls", None)
+        if topk_cls is None:
+            topk_cls = getattr(self.args, "topk_cls", 1)
+        return max(int(topk_cls), 1)
+
     def postprocess(self, preds, img, orig_imgs, **kwargs):
         """Post-process predictions and return a list of Results objects.
 
@@ -43,7 +50,11 @@ class DetectionPredictor(BasePredictor):
             **kwargs (Any): Additional keyword arguments.
 
         Returns:
-            (list): List of Results objects containing the post-processed predictions.
+            (list): List of Results objects containing the post-processed predictions. With ``topk_cls=1`` (default),
+                each box uses the legacy layout ``[xyxy, conf, cls]``. With ``topk_cls>1`` (detect/segment tasks), box
+                data uses ``[xyxy, score1..K, class1..K]`` while ``Boxes.conf`` and ``Boxes.cls`` remain top-1 views for
+                backward compatibility. In this mode, ``Boxes.conf_topk`` and ``Boxes.cls_topk`` have shape ``(N, K)``,
+                ``Boxes.topk == K``, and helpers such as ``Results.summary()`` continue to report top-1 values.
 
         Examples:
             >>> predictor = DetectionPredictor(overrides=dict(model="yolo26n.pt"))
@@ -51,17 +62,22 @@ class DetectionPredictor(BasePredictor):
             >>> processed_results = predictor.postprocess(preds, img, orig_imgs)
         """
         save_feats = getattr(self, "_feats", None) is not None
+        topk_cls = self._resolve_topk_cls()
+        use_topk = self.args.task in {"detect", "segment"} and topk_cls > 1
+        topk = topk_cls if use_topk else 1
         preds = nms.non_max_suppression(
             preds,
             self.args.conf,
             self.args.iou,
             self.args.classes,
             self.args.agnostic_nms,
+            multi_label=use_topk,
             max_det=self.args.max_det,
             nc=0 if self.args.task == "detect" else len(self.model.names),
             end2end=getattr(self.model, "end2end", False),
             rotated=self.args.task == "obb",
             return_idxs=save_feats,
+            topk=topk,
         )
 
         if not isinstance(orig_imgs, list):  # input images are a torch.Tensor, not a list
@@ -110,7 +126,8 @@ class DetectionPredictor(BasePredictor):
         """Construct a single Results object from one image prediction.
 
         Args:
-            pred (torch.Tensor): Predicted boxes and scores with shape (N, 6) where N is the number of detections.
+            pred (torch.Tensor): Predicted boxes and scores where N is the number of detections. The box layout is ``(N,
+                6)`` for top-1 output or ``(N, 4 + 2K)`` when ``topk_cls>1``.
             img (torch.Tensor): Preprocessed image tensor used for inference.
             orig_img (np.ndarray): Original image before preprocessing.
             img_path (str): Path to the original image file.
@@ -119,4 +136,11 @@ class DetectionPredictor(BasePredictor):
             (Results): Results object containing the original image, image path, class names, and scaled bounding boxes.
         """
         pred[:, :4] = ops.scale_boxes(img.shape[2:], pred[:, :4], orig_img.shape)
+        topk_cls = self._resolve_topk_cls()
+        use_topk = self.args.task in {"detect", "segment"} and topk_cls > 1
+        if use_topk:
+            # Keep only top-k box layout columns so Boxes parsing is unaffected by any appended extras.
+            k = min(topk_cls, len(self.model.names))
+            box_cols = min(4 + (2 * k), pred.shape[1])
+            return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :box_cols])
         return Results(orig_img, path=img_path, names=self.model.names, boxes=pred[:, :6])

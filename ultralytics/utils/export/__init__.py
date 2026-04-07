@@ -3,7 +3,6 @@
 from .axelera import torch2axelera
 from .coreml import torch2coreml
 from .engine import onnx2engine, torch2onnx
-from .executorch import torch2executorch
 from .imx import torch2imx
 from .mnn import onnx2mnn
 from .ncnn import torch2ncnn

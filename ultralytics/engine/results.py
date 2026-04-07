@@ -771,6 +771,10 @@ class Results(SimpleClass, DataExportMixin):
             >>> for result in results:
             ...     summary = result.summary()
             ...     print(summary)
+
+        Notes:
+            For top-k detection outputs (``topk_cls>1``), this helper intentionally reports top-1 values via
+            ``Boxes.conf`` and ``Boxes.cls`` for backward compatibility.
         """
         # Create list of detection dictionaries
         results = []
@@ -833,9 +837,12 @@ class Boxes(BaseTensor):
         data (torch.Tensor | np.ndarray): The raw tensor containing detection boxes and associated data.
         orig_shape (tuple[int, int]): The original image dimensions (height, width).
         is_track (bool): Indicates whether tracking IDs are included in the box data.
+        topk (int): Number of class-score entries retained per box.
         xyxy (torch.Tensor | np.ndarray): Boxes in [x1, y1, x2, y2] format.
-        conf (torch.Tensor | np.ndarray): Confidence scores for each box.
-        cls (torch.Tensor | np.ndarray): Class labels for each box.
+        conf (torch.Tensor | np.ndarray): Top-1 confidence score for each box.
+        conf_topk (torch.Tensor | np.ndarray): Top-k confidence scores for each box with shape (N, K).
+        cls (torch.Tensor | np.ndarray): Top-1 class label for each box.
+        cls_topk (torch.Tensor | np.ndarray): Top-k class labels for each box with shape (N, K).
         id (torch.Tensor | None): Tracking IDs for each box (if available).
         xywh (torch.Tensor | np.ndarray): Boxes in [x, y, width, height] format.
         xyxyn (torch.Tensor | np.ndarray): Normalized [x1, y1, x2, y2] boxes relative to orig_shape.
@@ -866,16 +873,29 @@ class Boxes(BaseTensor):
         including both absolute and normalized forms.
 
         Args:
-            boxes (torch.Tensor | np.ndarray): A tensor or numpy array with detection boxes of shape (num_boxes, 6) or
-                (num_boxes, 7). Columns should contain [x1, y1, x2, y2, (optional) track_id, confidence, class].
+            boxes (torch.Tensor | np.ndarray): A tensor or numpy array with detection boxes. Supported layouts are [x1,
+                y1, x2, y2, conf, cls], [x1, y1, x2, y2, track_id, conf, cls], [x1, y1, x2, y2, score1..K, class1..K],
+                or [x1, y1, x2, y2, track_id, score1..K, class1..K].
             orig_shape (tuple[int, int]): The original image shape as (height, width). Used for normalization.
         """
         if boxes.ndim == 1:
             boxes = boxes[None, :]
         n = boxes.shape[-1]
-        assert n in {6, 7}, f"expected 6 or 7 values but got {n}"  # xyxy, track_id, conf, cls
+        if n in {6, 7}:  # legacy format [xyxy, (track_id), conf, cls]
+            self.is_track = n == 7
+            self.topk = 1
+        elif n >= 8 and n % 2 == 0:  # [xyxy, score1..K, class1..K]
+            self.is_track = False
+            self.topk = (n - 4) // 2
+        elif n >= 9 and n % 2 == 1:  # [xyxy, track_id, score1..K, class1..K]
+            self.is_track = True
+            self.topk = (n - 5) // 2
+        else:
+            raise AssertionError(f"expected 6/7 or topk box layout but got {n} values")
+
         super().__init__(boxes, orig_shape)
-        self.is_track = n == 7
+        self._conf_start = 5 if self.is_track else 4
+        self._cls_start = self._conf_start + self.topk
         self.orig_shape = orig_shape
 
     @property
@@ -896,11 +916,11 @@ class Boxes(BaseTensor):
 
     @property
     def conf(self) -> torch.Tensor | np.ndarray:
-        """Return the confidence scores for each detection box.
+        """Return the top-1 confidence scores for each detection box.
 
         Returns:
-            (torch.Tensor | np.ndarray): A 1D tensor or array containing confidence scores for each detection, with
-                shape (N,) where N is the number of detections.
+            (torch.Tensor | np.ndarray): A 1D tensor or array containing top-1 confidence scores for each detection,
+                with shape (N,) where N is the number of detections.
 
         Examples:
             >>> boxes = Boxes(torch.tensor([[10, 20, 30, 40, 0.9, 0]]), orig_shape=(100, 100))
@@ -908,14 +928,23 @@ class Boxes(BaseTensor):
             >>> print(conf_scores)
             tensor([0.9000])
         """
-        return self.data[:, -2]
+        return self.conf_topk[:, 0]
+
+    @property
+    def conf_topk(self) -> torch.Tensor | np.ndarray:
+        """Return top-k confidence scores for each detection box.
+
+        Returns:
+            (torch.Tensor | np.ndarray): A tensor or array with shape (N, K), where N is detections and K is top-k.
+        """
+        return self.data[:, self._conf_start : self._conf_start + self.topk]
 
     @property
     def cls(self) -> torch.Tensor | np.ndarray:
-        """Return the class ID tensor representing category predictions for each bounding box.
+        """Return the top-1 class ID tensor representing category predictions for each bounding box.
 
         Returns:
-            (torch.Tensor | np.ndarray): A tensor or numpy array containing the class IDs for each detection box. The
+            (torch.Tensor | np.ndarray): A tensor or numpy array containing top-1 class IDs for each detection box. The
                 shape is (N,), where N is the number of boxes.
 
         Examples:
@@ -924,7 +953,16 @@ class Boxes(BaseTensor):
             >>> class_ids = boxes.cls
             >>> print(class_ids)  # tensor([0., 2., 1.])
         """
-        return self.data[:, -1]
+        return self.cls_topk[:, 0]
+
+    @property
+    def cls_topk(self) -> torch.Tensor | np.ndarray:
+        """Return top-k class IDs for each detection box.
+
+        Returns:
+            (torch.Tensor | np.ndarray): A tensor or array with shape (N, K), where N is detections and K is top-k.
+        """
+        return self.data[:, self._cls_start : self._cls_start + self.topk]
 
     @property
     def id(self) -> torch.Tensor | np.ndarray | None:
@@ -948,7 +986,7 @@ class Boxes(BaseTensor):
             - This property is only available when tracking is enabled (i.e., when `is_track` is True).
             - The tracking IDs are typically used to associate detections across multiple frames in video analysis.
         """
-        return self.data[:, -3] if self.is_track else None
+        return self.data[:, 4] if self.is_track else None
 
     @property
     @lru_cache(maxsize=2)
