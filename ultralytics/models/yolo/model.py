@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-
-import torch
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from ultralytics.data.build import load_inference_source
 from ultralytics.engine.model import Model
@@ -21,6 +19,13 @@ from ultralytics.nn.tasks import (
     YOLOESegModel,
 )
 from ultralytics.utils import ROOT, YAML
+
+if TYPE_CHECKING:
+    from collections.abc import Generator
+
+    import torch
+
+    from ultralytics.engine.results import Results
 
 
 class YOLO(Model):
@@ -50,7 +55,7 @@ class YOLO(Model):
         >>> model = YOLO("yolo26n.yaml")
     """
 
-    def __init__(self, model: str | Path = "yolo26n.pt", task: str | None = None, verbose: bool = False):
+    def __init__(self, model: str | Path = "yolo26n.pt", task: str | None = None, verbose: bool = False) -> None:
         """Initialize a YOLO model.
 
         This constructor initializes a YOLO model, automatically switching to specialized model types (YOLOWorld or
@@ -251,7 +256,7 @@ class YOLOE(Model):
             },
         }
 
-    def get_text_pe(self, texts):
+    def get_text_pe(self, texts) -> torch.Tensor | None:
         """Get text positional embeddings for the given texts."""
         assert isinstance(self.model, YOLOEModel)
         return self.model.get_text_pe(texts)
@@ -298,7 +303,7 @@ class YOLOE(Model):
         assert isinstance(self.model, YOLOEModel)
         self.model.set_vocab(vocab, names=names)
 
-    def get_vocab(self, names):
+    def get_vocab(self, names) -> torch.nn.ModuleList:
         """Get vocabulary for the given class names."""
         assert isinstance(self.model, YOLOEModel)
         return self.model.get_vocab(names)
@@ -348,6 +353,28 @@ class YOLOE(Model):
         self.metrics = validator.metrics
         return validator.metrics
 
+    @overload
+    def predict(
+        self,
+        source=None,
+        stream: Literal[True] = True,
+        visual_prompts: dict[str, list] = {},
+        refer_image=None,
+        predictor=yolo.yoloe.YOLOEVPDetectPredictor,
+        **kwargs,
+    ) -> Generator[Results]: ...
+
+    @overload
+    def predict(
+        self,
+        source=None,
+        stream: Literal[False] = False,
+        visual_prompts: dict[str, list] = {},
+        refer_image=None,
+        predictor=yolo.yoloe.YOLOEVPDetectPredictor,
+        **kwargs,
+    ) -> list[Results]: ...
+
     def predict(
         self,
         source=None,
@@ -356,7 +383,7 @@ class YOLOE(Model):
         refer_image=None,
         predictor=yolo.yoloe.YOLOEVPDetectPredictor,
         **kwargs,
-    ):
+    ) -> Generator[Results] | list[Results]:
         """Run prediction on images, videos, directories, streams, etc.
 
         Args:
