@@ -2,26 +2,27 @@
 """
 Export a YOLO PyTorch model to other formats. TensorFlow exports authored by https://github.com/zldrobit.
 
-Format                  | `format=argument`         | Model
----                     | ---                       | ---
-PyTorch                 | -                         | yolo26n.pt
-TorchScript             | `torchscript`             | yolo26n.torchscript
-ONNX                    | `onnx`                    | yolo26n.onnx
-OpenVINO                | `openvino`                | yolo26n_openvino_model/
-TensorRT                | `engine`                  | yolo26n.engine
-CoreML                  | `coreml`                  | yolo26n.mlpackage
-TensorFlow SavedModel   | `saved_model`             | yolo26n_saved_model/
-TensorFlow GraphDef     | `pb`                      | yolo26n.pb
-TensorFlow Lite         | `tflite`                  | yolo26n.tflite
-TensorFlow Edge TPU     | `edgetpu`                 | yolo26n_edgetpu.tflite
-TensorFlow.js           | `tfjs`                    | yolo26n_web_model/
-PaddlePaddle            | `paddle`                  | yolo26n_paddle_model/
-MNN                     | `mnn`                     | yolo26n.mnn
-NCNN                    | `ncnn`                    | yolo26n_ncnn_model/
-IMX                     | `imx`                     | yolo26n_imx_model/
-RKNN                    | `rknn`                    | yolo26n_rknn_model/
-ExecuTorch              | `executorch`              | yolo26n_executorch_model/
-Axelera AI              | `axelera`                 | yolo26n_axelera_model/
+Format                            | `format=argument`                  | Model
+---                               | ---                                | ---
+PyTorch                           | -                                  | yolo26n.pt
+TorchScript                       | `torchscript`                      | yolo26n.torchscript
+ONNX                              | `onnx`                             | yolo26n.onnx
+OpenVINO                          | `openvino`                         | yolo26n_openvino_model/
+TensorRT                          | `engine`                           | yolo26n.engine
+CoreML                            | `coreml`                           | yolo26n.mlpackage
+TensorFlow SavedModel             | `saved_model`                      | yolo26n_saved_model/
+TensorFlow GraphDef               | `pb`                               | yolo26n.pb
+TensorFlow Lite                   | `tflite`                           | yolo26n.tflite
+TensorFlow Edge TPU               | `edgetpu`                          | yolo26n_edgetpu.tflite
+TensorFlow.js                     | `tfjs`                             | yolo26n_web_model/
+PaddlePaddle                      | `paddle`                           | yolo26n_paddle_model/
+MNN                               | `mnn`                              | yolo26n.mnn
+NCNN                              | `ncnn`                             | yolo26n_ncnn_model/
+IMX                               | `imx`                              | yolo26n_imx_model/
+RKNN                              | `rknn`                             | yolo26n_rknn_model/
+ExecuTorch                        | `executorch`                       | yolo26n_executorch_model/
+Axelera AI                        | `axelera`                          | yolo26n_axelera_model/
+PT2 (ExportedProgram)             | `pt2`                              | yolo26n.pt2
 
 Requirements:
     $ pip install "ultralytics[export]"
@@ -52,6 +53,7 @@ Inference:
                          yolo26n_rknn_model         # RKNN
                          yolo26n_executorch_model   # ExecuTorch
                          yolo26n_axelera_model      # Axelera AI
+                         yolo26n.pt2                # ExportedProgram (PT2)
 
 TensorFlow.js:
     $ cd .. && git clone https://github.com/zldrobit/tfjs-yolov5-example.git && cd tfjs-yolov5-example
@@ -168,6 +170,7 @@ def export_formats():
         ["RKNN", "rknn", "_rknn_model", False, False, ["batch", "name"]],
         ["ExecuTorch", "executorch", "_executorch_model", True, False, ["batch"]],
         ["Axelera AI", "axelera", "_axelera_model", False, False, ["batch", "int8", "fraction", "data"]],
+        ["PT2", "pt2", ".pt2", True, False, ["batch"]],
     ]
     return dict(zip(["Format", "Argument", "Suffix", "CPU", "GPU", "Arguments"], zip(*x)))
 
@@ -256,6 +259,7 @@ class Exporter:
         export_imx: Export model to IMX format.
         export_executorch: Export model to ExecuTorch format.
         export_axelera: Export model to Axelera format.
+        export_pt2: Export model to ExportedProgram (PT2) format.
 
     Examples:
         Export a YOLO26 model to ONNX format
@@ -1024,6 +1028,14 @@ class Exporter:
             metadata=self.metadata,
             prefix=prefix,
         )
+
+    @try_export
+    def export_pt2(self, prefix=colorstr("PT2:")):
+        """Export YOLO model to torch.export ExportedProgram *.pt2 format."""
+        assert TORCH_2_9, f"ExportedProgram (PT2) requires torch>=2.9.0 but torch=={TORCH_VERSION} is installed"
+        from ultralytics.utils.export.pt2 import torch2pt2
+
+        return torch2pt2(self.model, self.file, self.im, metadata=self.metadata, prefix=prefix)
 
     @try_export
     def export_executorch(self, prefix=colorstr("ExecuTorch:")):
