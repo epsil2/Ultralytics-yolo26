@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 import contextlib
+import os
 import pickle
 import re
 import types
@@ -66,6 +67,7 @@ from ultralytics.nn.modules import (
     SCDown,
     Segment,
     Segment26,
+    SemanticSegment,
     TorchVision,
     WorldDetect,
     YOLOEDetect,
@@ -78,6 +80,7 @@ from ultralytics.utils.checks import check_requirements, check_suffix, check_yam
 from ultralytics.utils.loss import (
     E2ELoss,
     PoseLoss26,
+    SemSegLoss,
     v8ClassificationLoss,
     v8DetectionLoss,
     v8OBBLoss,
@@ -1279,6 +1282,18 @@ class YOLOESegModel(YOLOEModel, SegmentationModel):
         return self.criterion(preds, batch)
 
 
+class SemanticModel(DetectionModel):
+    """YOLOv8 segmentation model."""
+
+    def __init__(self, cfg="yolov8n-seg.yaml", ch=3, nc=None, verbose=True):
+        """Initialize YOLOv8 segmentation model with given config and parameters."""
+        super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
+
+    def init_criterion(self):
+        """Initialize the loss criterion for the SegmentationModel."""
+        return SemSegLoss(self)
+
+
 class Ensemble(torch.nn.ModuleList):
     """Ensemble of models.
 
@@ -1432,7 +1447,10 @@ def torch_safe_load(weight, safe_only=False):
     from ultralytics.utils.downloads import attempt_download_asset
 
     check_suffix(file=weight, suffix=".pt")
-    file = attempt_download_asset(weight)  # search online if missing locally
+    if str(weight).split(os.sep)[-1] != "yolo11n-semseg.pt":
+        file = attempt_download_asset(weight)  # search online if missing locally
+    else:
+        file = attempt_download_asset(weight, repo="kuazhangxiaoai/ultralytics-semantic-segment", release="pretrained")
     try:
         with temporary_modules(
             modules={
@@ -1678,6 +1696,9 @@ def parse_model(d, ch, verbose=True):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is SemanticSegment:
+            args.append([ch[x] for x in f])
+            args[2] = make_divisible(min(args[2], max_channels) * width, 8)
         elif m in frozenset(
             {
                 Detect,
@@ -1749,7 +1770,7 @@ def yaml_model_load(path):
     unified_path = re.sub(r"(\d+)([nslmx])(.+)?$", r"\1\3", str(path))  # i.e. yolov8x.yaml -> yolov8.yaml
     yaml_file = check_yaml(unified_path, hard=False) or check_yaml(path)
     d = YAML.load(yaml_file)  # model dict
-    d["scale"] = guess_model_scale(path)
+    d["scale"] = guess_model_scale(path) if "scale" not in d.keys() else d["scale"]
     d["yaml_file"] = str(path)
     return d
 

@@ -15,12 +15,12 @@ from ultralytics.utils import NOT_MACOS14
 from ultralytics.utils.tal import dist2bbox, dist2rbox, make_anchors
 from ultralytics.utils.torch_utils import TORCH_1_11, fuse_conv_and_bn, smart_inference_mode
 
-from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN
+from .block import DFL, SAVPE, BNContrastiveHead, ContrastiveHead, Proto, Proto26, RealNVP, Residual, SwiGLUFFN, C3k2
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect"
+__all__ = "OBB", "Classify", "Detect", "Pose", "RTDETRDecoder", "Segment", "YOLOEDetect", "YOLOESegment", "v10Detect", "SemanticSegment"
 
 
 class Detect(nn.Module):
@@ -38,7 +38,7 @@ class Detect(nn.Module):
         shape (tuple): Input shape.
         anchors (torch.Tensor): Anchor points.
         strides (torch.Tensor): Feature map strides.
-        legacy (bool): Backward compatibility for v3/v5/v8/v9/v11 models.
+        legacy (bool): Backward compatibility for v3/v5/v8/v9 models.
         xyxy (bool): Output format, xyxy or xywh.
         nc (int): Number of classes.
         nl (int): Number of detection layers.
@@ -53,6 +53,7 @@ class Detect(nn.Module):
 
     Methods:
         forward: Perform forward pass and return predictions.
+        forward_end2end: Perform forward pass for end-to-end detection.
         bias_init: Initialize detection head biases.
         decode_bboxes: Decode bounding boxes from predictions.
         postprocess: Post-process model predictions.
@@ -68,7 +69,6 @@ class Detect(nn.Module):
     export = False  # export mode
     format = None  # export format
     max_det = 300  # max_det
-    agnostic_nms = False
     shape = None
     anchors = torch.empty(0)  # init
     strides = torch.empty(0)  # init
@@ -114,7 +114,7 @@ class Detect(nn.Module):
 
     @property
     def one2many(self):
-        """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
+        """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
         return dict(box_head=self.cv2, cls_head=self.cv3)
 
     @property
@@ -124,12 +124,11 @@ class Detect(nn.Module):
 
     @property
     def end2end(self):
-        """Checks if the model has one2one for v3/v5/v8/v9/v11 backward compatibility."""
-        return getattr(self, "_end2end", True) and hasattr(self, "one2one")
+        """Checks if the model has one2one for v5/v5/v8/v9/11 backward compatibility."""
+        return hasattr(self, "one2one")
 
     @end2end.setter
     def end2end(self, value):
-        """Override the end-to-end detection mode."""
         self._end2end = value
 
     def forward_head(
@@ -163,7 +162,7 @@ class Detect(nn.Module):
         """Decode predicted bounding boxes and class probabilities based on multiple-level feature maps.
 
         Args:
-            x (dict[str, torch.Tensor]): Dictionary of predictions from detection layers.
+            x (dict[str, torch.Tensor]): List of feature maps from different detection layers.
 
         Returns:
             (torch.Tensor): Concatenated tensor of decoded bounding boxes and class probabilities.
@@ -210,11 +209,11 @@ class Detect(nn.Module):
 
         Args:
             preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc) with last dimension
-                format [x1, y1, x2, y2, class_probs].
+                format [x, y, w, h, class_probs].
 
         Returns:
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6) and last
-                dimension format [x1, y1, x2, y2, max_class_prob, class_index].
+                dimension format [x, y, w, h, max_class_prob, class_index].
         """
         boxes, scores = preds.split([4, self.nc], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
@@ -235,11 +234,6 @@ class Detect(nn.Module):
         # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
         # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
         k = max_det if self.export else min(max_det, anchors)
-        if self.agnostic_nms:
-            scores, labels = scores.max(dim=-1, keepdim=True)
-            scores, indices = scores.topk(k, dim=1)
-            labels = labels.gather(1, indices)
-            return scores, labels, indices
         ori_index = scores.max(dim=-1)[0].topk(k)[1].unsqueeze(-1)
         scores = scores.gather(dim=1, index=ori_index.repeat(1, 1, nc))
         scores, index = scores.flatten(1).topk(k)
@@ -325,7 +319,7 @@ class Segment(Detect):
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, mask_head: torch.nn.Module
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """Concatenates and returns predicted bounding boxes, class probabilities, and mask coefficients."""
         preds = super().forward_head(x, box_head, cls_head)
         if mask_head is not None:
@@ -338,11 +332,11 @@ class Segment(Detect):
 
         Args:
             preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + nm) with last dimension
-                format [x1, y1, x2, y2, class_probs, mask_coefficient].
+                format [x, y, w, h, class_probs, mask_coefficient].
 
         Returns:
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + nm) and last
-                dimension format [x1, y1, x2, y2, max_class_prob, class_index, mask_coefficient].
+                dimension format [x, y, w, h, max_class_prob, class_index, mask_coefficient].
         """
         boxes, scores, mask_coefficient = preds.split([4, self.nc, self.nm], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
@@ -358,12 +352,12 @@ class Segment(Detect):
 class Segment26(Segment):
     """YOLO26 Segment head for segmentation models.
 
-    This class extends the Segment head with Proto26 for mask prediction in instance segmentation tasks.
+    This class extends the Detect head to include mask prediction capabilities for instance segmentation tasks.
 
     Attributes:
         nm (int): Number of masks.
         npr (int): Number of protos.
-        proto (Proto26): Prototype generation module.
+        proto (Proto): Prototype generation module.
         cv4 (nn.ModuleList): Convolution layers for mask coefficients.
 
     Methods:
@@ -466,13 +460,13 @@ class OBB(Detect):
     def _inference(self, x: dict[str, torch.Tensor]) -> torch.Tensor:
         """Decode predicted bounding boxes and class probabilities, concatenated with rotation angles."""
         # For decode_bboxes convenience
-        self.angle = x["angle"]
+        self.angle = x["angle"]  # TODO: need to test obb
         preds = super()._inference(x)
         return torch.cat([preds, x["angle"]], dim=1)
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """Concatenates and returns predicted bounding boxes, class probabilities, and angles."""
         preds = super().forward_head(x, box_head, cls_head)
         if angle_head is not None:
@@ -527,12 +521,12 @@ class OBB26(OBB):
         Create an OBB26 detection head
         >>> obb26 = OBB26(nc=80, ne=1, ch=(256, 512, 1024))
         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
-        >>> outputs = obb26(x)
+        >>> outputs = obb26(x).
     """
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, angle_head: torch.nn.Module
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """Concatenates and returns predicted bounding boxes, class probabilities, and raw angles."""
         preds = Detect.forward_head(self, x, box_head, cls_head)
         if angle_head is not None:
@@ -601,7 +595,7 @@ class Pose(Detect):
 
     def forward_head(
         self, x: list[torch.Tensor], box_head: torch.nn.Module, cls_head: torch.nn.Module, pose_head: torch.nn.Module
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """Concatenates and returns predicted bounding boxes, class probabilities, and keypoints."""
         preds = super().forward_head(x, box_head, cls_head)
         if pose_head is not None:
@@ -614,11 +608,11 @@ class Pose(Detect):
 
         Args:
             preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + nk) with last dimension
-                format [x1, y1, x2, y2, class_probs, keypoints].
+                format [x, y, w, h, class_probs, keypoints].
 
         Returns:
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + self.nk) and
-                last dimension format [x1, y1, x2, y2, max_class_prob, class_index, keypoints].
+                last dimension format [x, y, w, h, max_class_prob, class_index, keypoints].
         """
         boxes, scores, kpts = preds.split([4, self.nc, self.nk], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
@@ -655,7 +649,7 @@ class Pose(Detect):
 class Pose26(Pose):
     """YOLO26 Pose head for keypoints models.
 
-    This class extends the Pose head with normalizing flow for keypoint prediction in pose estimation tasks.
+    This class extends the Detect head to include keypoint prediction capabilities for pose estimation tasks.
 
     Attributes:
         kpt_shape (tuple): Number of keypoints and dimensions (2 for x,y or 3 for x,y,visible).
@@ -668,7 +662,7 @@ class Pose26(Pose):
 
     Examples:
         Create a pose detection head
-        >>> pose = Pose26(nc=80, kpt_shape=(17, 3), ch=(256, 512, 1024))
+        >>> pose = Pose(nc=80, kpt_shape=(17, 3), ch=(256, 512, 1024))
         >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
         >>> outputs = pose(x)
     """
@@ -728,7 +722,7 @@ class Pose26(Pose):
         pose_head: torch.nn.Module,
         kpts_head: torch.nn.Module,
         kpts_sigma_head: torch.nn.Module,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """Concatenates and returns predicted bounding boxes, class probabilities, and keypoints."""
         preds = Detect.forward_head(self, x, box_head, cls_head)
         if pose_head is not None:
@@ -782,7 +776,7 @@ class Classify(nn.Module):
         linear (nn.Linear): Linear layer for final classification.
 
     Methods:
-        forward: Perform forward pass on input feature maps.
+        forward: Perform forward pass of the YOLO model on input image data.
 
     Examples:
         Create a classification head
@@ -799,10 +793,10 @@ class Classify(nn.Module):
         Args:
             c1 (int): Number of input channels.
             c2 (int): Number of output classes.
-            k (int): Kernel size.
-            s (int): Stride.
+            k (int, optional): Kernel size.
+            s (int, optional): Stride.
             p (int, optional): Padding.
-            g (int): Groups.
+            g (int, optional): Groups.
         """
         super().__init__()
         c_ = 1280  # efficientnet_b0 size
@@ -812,7 +806,7 @@ class Classify(nn.Module):
         self.linear = nn.Linear(c_, c2)  # to x(b,c2)
 
     def forward(self, x: list[torch.Tensor] | torch.Tensor) -> torch.Tensor | tuple:
-        """Perform forward pass on input feature maps."""
+        """Perform forward pass of the YOLO model on input image data."""
         if isinstance(x, list):
             x = torch.cat(x, 1)
         x = self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
@@ -1108,7 +1102,7 @@ class YOLOEDetect(Detect):
         boxes, scores, index = [], [], []
         bs = x[0].shape[0]
         cv2 = self.cv2 if not self.end2end else self.one2one_cv2
-        cv3 = self.cv3 if not self.end2end else self.one2one_cv3
+        cv3 = self.cv3 if not self.end2end else self.one2one_cv2
         for i in range(self.nl):
             cls_feat = cv3[i](x[i])
             loc_feat = cv2[i](x[i])
@@ -1136,7 +1130,7 @@ class YOLOEDetect(Detect):
 
     @property
     def one2many(self):
-        """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
+        """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
         return dict(box_head=self.cv2, cls_head=self.cv3, contrastive_head=self.cv4)
 
     @property
@@ -1145,7 +1139,7 @@ class YOLOEDetect(Detect):
         return dict(box_head=self.one2one_cv2, cls_head=self.one2one_cv3, contrastive_head=self.one2one_cv4)
 
     def forward_head(self, x, box_head, cls_head, contrastive_head):
-        """Concatenates and returns predicted bounding boxes, class probabilities, and contrastive scores."""
+        """Concatenates and returns predicted bounding boxes, class probabilities, and text embeddings."""
         assert len(x) == 4, f"Expected 4 features including 3 feature maps and 1 text embeddings, but got {len(x)}."
         if box_head is None or cls_head is None:  # for fused inference
             return dict()
@@ -1233,7 +1227,7 @@ class YOLOESegment(YOLOEDetect):
 
     @property
     def one2many(self):
-        """Returns the one-to-many head components, here for v3/v5/v8/v9/v11 backward compatibility."""
+        """Returns the one-to-many head components, here for v5/v5/v8/v9/11 backward compatibility."""
         return dict(box_head=self.cv2, cls_head=self.cv3, mask_head=self.cv5, contrastive_head=self.cv4)
 
     @property
@@ -1306,7 +1300,7 @@ class YOLOESegment(YOLOEDetect):
         cls_head: torch.nn.Module,
         mask_head: torch.nn.Module,
         contrastive_head: torch.nn.Module,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         """Concatenates and returns predicted bounding boxes, class probabilities, and mask coefficients."""
         preds = super().forward_head(x, box_head, cls_head, contrastive_head)
         if mask_head is not None:
@@ -1319,11 +1313,11 @@ class YOLOESegment(YOLOEDetect):
 
         Args:
             preds (torch.Tensor): Raw predictions with shape (batch_size, num_anchors, 4 + nc + nm) with last dimension
-                format [x1, y1, x2, y2, class_probs, mask_coefficient].
+                format [x, y, w, h, class_probs, mask_coefficient].
 
         Returns:
             (torch.Tensor): Processed predictions with shape (batch_size, min(max_det, num_anchors), 6 + nm) and last
-                dimension format [x1, y1, x2, y2, max_class_prob, class_index, mask_coefficient].
+                dimension format [x, y, w, h, max_class_prob, class_index, mask_coefficient].
         """
         boxes, scores, mask_coefficient = preds.split([4, self.nc, self.nm], dim=-1)
         scores, conf, idx = self.get_topk_index(scores, self.max_det)
@@ -1344,7 +1338,7 @@ class YOLOESegment(YOLOEDetect):
 class YOLOESegment26(YOLOESegment):
     """YOLOE-style segmentation head module using Proto26 for mask generation.
 
-    This class extends the YOLOESegment functionality to include segmentation capabilities by integrating a Proto26
+    This class extends the YOLOEDetect functionality to include segmentation capabilities by integrating a prototype
     generation module and convolutional layers to predict mask coefficients.
 
     Args:
@@ -1353,7 +1347,7 @@ class YOLOESegment26(YOLOESegment):
         npr (int): Number of prototype channels. Defaults to 256.
         embed (int): Embedding dimensionality. Defaults to 512.
         with_bn (bool): Whether to use Batch Normalization. Defaults to False.
-        reg_max (int): Maximum number of DFL channels. Defaults to 16.
+        reg_max (int): Maximum regression value for bounding boxes. Defaults to 16.
         end2end (bool): Whether to use end-to-end detection mode. Defaults to False.
         ch (tuple[int, ...]): Input channels for each scale.
 
@@ -1776,3 +1770,280 @@ class v10Detect(Detect):
     def fuse(self):
         """Remove the one2many head for inference optimization."""
         self.cv2 = self.cv3 = None
+class ContextGather(nn.Module):
+    """The implementation for context gather block Input: N X C X H X W Parameters: cls_num : the number of classes
+    scale : the scale factor for probability map.
+
+    Returns:
+        N X C X H X W.
+    """
+
+    def __init__(self, cls_num=0, scale=1):
+        super().__init__()
+        self.cls_num = cls_num
+        self.scale = scale
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, feats, probs):
+        """Forward methods of context attention module.
+
+        Args:
+            feats: feature map
+            probs: probability map.
+
+        Returns:
+            attention (torch.Tensor): Attention of context
+        """
+        batch_size, c, _h, _w = probs.size(0), probs.size(1), probs.size(2), probs.size(3)
+        probs = probs.view(batch_size, c, -1)
+        feats = feats.view(batch_size, feats.size(1), -1)
+        feats = feats.permute(0, 2, 1)  # batch x hw x c
+        probs = F.softmax(self.scale * probs, dim=2)  # batch x k x hw
+        ocr_context = torch.matmul(probs, feats).permute(0, 2, 1).unsqueeze(3)  # batch x k x c
+        return ocr_context
+
+
+class _ObjectAttentionBlock(nn.Module):
+    """The basic implementation for object context block Input: N X C X H X W Parameters: in_channels : the dimension of
+    the input feature map key_channels : the dimension after the key/query transform scale : choose the scale to
+    downsample the input feature maps (save memory cost) use_gt : whether use the ground truth label map to compute
+    the similarity map fetch_attention : whether return the estimated similarity map bn_type : specify the bn type.
+
+    Returns:
+        N X C X H X W.
+    """
+
+    def __init__(self, in_channels, key_channels, scale=1, use_gt=False, use_bg=False, fetch_attention=False):
+        super().__init__()
+        self.scale = scale
+        self.in_channels = in_channels
+        self.key_channels = key_channels
+        self.use_gt = use_gt
+        self.use_bg = use_bg
+        self.fetch_attention = fetch_attention
+        self.pool = nn.MaxPool2d(kernel_size=(scale, scale))
+        self.f_pixel = nn.Sequential(
+            Conv(c1=self.in_channels, c2=self.key_channels, k=1, s=1, p=0, act=False),
+            Conv(c1=self.key_channels, c2=self.key_channels, k=1, s=1, p=0, act=False),
+        )
+        self.f_object = nn.Sequential(
+            Conv(c1=self.in_channels, c2=self.key_channels, k=1, s=1, p=0, act=False),
+            Conv(c1=self.key_channels, c2=self.key_channels, k=1, s=1, p=0, act=False),
+        )
+        self.f_down = nn.Sequential(
+            Conv(c1=self.in_channels, c2=self.key_channels, k=1, s=1, p=0, act=False),
+        )
+        self.f_up = nn.Sequential(
+            Conv(c1=self.key_channels, c2=self.in_channels, k=1, s=1, p=0, act=False),
+        )
+
+    def forward(self, x, proxy, gt_label=None):
+        batch_size, h, w = x.size(0), x.size(2), x.size(3)
+        if self.scale > 1:
+            x = self.pool(x)
+
+        query = self.f_pixel(x).view(batch_size, self.key_channels, -1)
+        query = query.permute(0, 2, 1)
+        key = self.f_object(proxy).view(batch_size, self.key_channels, -1)
+        value = self.f_down(proxy).view(batch_size, self.key_channels, -1)
+        value = value.permute(0, 2, 1)
+
+        sim_map = torch.matmul(query, key)
+        sim_map = (self.key_channels**-0.5) * sim_map
+        sim_map = F.softmax(sim_map, dim=-1)
+
+        # add bg context ...
+        context = torch.matmul(sim_map, value)  # hw x k x k x c
+        context = context.permute(0, 2, 1).contiguous()
+        context = context.view(batch_size, self.key_channels, *x.size()[2:])
+        context = self.f_up(context)
+
+        if self.scale > 1:
+            context = F.interpolate(input=context, size=(h, w), mode="bilinear", align_corners=True)
+        return context
+
+
+class ObjectAttentionBlock2D(_ObjectAttentionBlock):
+    def __init__(self, in_channels, key_channels, scale=1, use_gt=False, use_bg=False, fetch_attention=False):
+        super().__init__(in_channels, key_channels, scale, use_gt, use_bg, fetch_attention)
+
+
+class SpatialOCR(nn.Module):
+    """Implementation of the OCR module: We aggregate the global object representation to update the representation for
+    each pixel.
+
+    use_gt=True: whether use the ground-truth label to compute the ideal object contextual representations. use_bg=True:
+    use the ground-truth label to compute the ideal background context to augment the representations. use_oc=True: use
+    object context or not.
+    """
+
+    def __init__(
+        self,
+        in_channels,
+        key_channels,
+        out_channels,
+        scale=1,
+        dropout=0.1,
+        use_gt=False,
+        use_bg=False,
+        use_oc=True,
+        fetch_attention=False,
+    ):
+        super().__init__()
+        self.use_gt = use_gt
+        self.use_bg = use_bg
+        self.use_oc = use_oc
+        self.fetch_attention = fetch_attention
+        self.object_context_block = ObjectAttentionBlock2D(
+            in_channels, key_channels, scale, use_gt, use_bg, fetch_attention
+        )
+        if self.use_bg:
+            if self.use_oc:
+                _in_channels = 3 * in_channels
+            else:
+                _in_channels = 2 * in_channels
+        else:
+            _in_channels = 2 * in_channels
+
+        self.conv_bn_dropout = nn.Sequential(Conv(_in_channels, out_channels, k=1, p=0), nn.Dropout2d(dropout))
+
+    def forward(self, feats, proxy_feats, gt_label=None):
+        if self.use_gt and gt_label is not None:
+            if self.use_bg:
+                context, bg_context = self.object_context_block(feats, proxy_feats, gt_label)
+            else:
+                context = self.object_context_block(feats, proxy_feats, gt_label)
+        else:
+            if self.fetch_attention:
+                context, sim_map = self.object_context_block(feats, proxy_feats)
+            else:
+                context = self.object_context_block(feats, proxy_feats)
+
+        if self.use_bg:
+            if self.use_oc:
+                output = self.conv_bn_dropout(torch.cat([context, bg_context, feats], 1))
+            else:
+                output = self.conv_bn_dropout(torch.cat([bg_context, feats], 1))
+        else:
+            output = self.conv_bn_dropout(torch.cat([context, feats], 1))
+
+        if self.fetch_attention:
+            return output, sim_map
+        else:
+            return output
+
+
+class SemanticSegment(nn.Module):
+    """YOLO Semseg head for senmantic models.
+
+    This class extends the Detect head to include mask prediction capabilities for instance segmentation tasks.
+
+    Attributes:
+        nc (int): Number of classes.
+        ch (int): Number of channels.
+
+    Methods:
+        forward: Return mask.
+
+    Examples:
+        Create a segmentation head
+        >>> SemanticSegment = SemanticSegment(nc=80, ch=(256, 512, 1024))
+        >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+        >>> outputs = SemanticSegment(x)
+    """
+
+    def __init__(self, nc=80, ns=8, npr=256, ch=()):
+        """Initialize for semantic segment modular.
+
+        Args:
+            nc(int): number of classes
+            ns(int): stride
+            npr(int): number of feature
+            ch(list[int]): channels of features.
+        """
+        super().__init__()
+        self.nc = nc
+        self.ns = ns
+        self.npr = npr
+        self.chs = torch.tensor(ch).sum().item()
+        self.conv = nn.Conv2d(self.chs, self.npr * 2, kernel_size=3, stride=1, padding=1)
+        self.cls_head = nn.Conv2d(self.npr * 2, self.nc, kernel_size=3, stride=1, padding=1)
+
+        self.norm_head = nn.Sequential(
+            Conv(self.chs, self.chs, k=3, s=1, p=1), nn.Conv2d(self.chs, self.nc, kernel_size=1, stride=1, padding=0)
+        )
+
+        self.context_gather = ContextGather(self.nc)
+        self.context_ocr = SpatialOCR(
+            in_channels=self.npr * 2, key_channels=self.npr, out_channels=self.npr * 2, scale=1, dropout=0.05
+        )
+
+    def forward(self, x):
+        """Model forward function of semantic segment modular.
+
+        Args:
+            x(list): features from backbone or neck.
+
+        Returns:
+            mask(torch.Tensor): output for semantic segment task
+        """
+        _, _, h, w = x[0].shape
+        f1 = x[0]
+        f2 = F.interpolate(x[1], size=(h, w), mode="bilinear", align_corners=True)
+        f3 = F.interpolate(x[2], size=(h, w), mode="bilinear", align_corners=True)
+        fs = torch.cat([f1, f2, f3], dim=1)
+        out_0 = self.norm_head(fs)
+
+        fs = self.conv(fs)
+        context = self.context_gather(fs, out_0)
+        feats = self.context_ocr(fs, context)
+        out = self.cls_head(feats)
+        out_0 = F.interpolate(out_0, size=(h * self.ns, w * self.ns), mode="bilinear", align_corners=True)
+        out = F.interpolate(out, size=(h * self.ns, w * self.ns), mode="bilinear", align_corners=True)
+        if self.training:
+            return out_0, out
+        else:
+            return out
+
+class YunetSegment(nn.Module):
+    """YOLO Semseg head for senmantic models.
+
+        This class extends the Detect head to include mask prediction capabilities for instance segmentation tasks.
+
+        Attributes:
+            nc (int): Number of classes.
+            ch (int): Number of channels.
+
+        Methods:
+            forward: Return mask.
+
+        Examples:
+            Create a segmentation head
+            >>> SemanticSegment = SemanticSegment(nc=80, ch=(256, 512, 1024))
+            >>> x = [torch.randn(1, 256, 80, 80), torch.randn(1, 512, 40, 40), torch.randn(1, 1024, 20, 20)]
+            >>> outputs = SemanticSegment(x)
+        """
+    def __init__(self, nc=80, ns=8, npr=256, arg=None, ch=()):
+        super().__init__()
+        self.npr = npr
+        self.ns = ns
+        self.chs = torch.tensor(ch).sum().item()
+        self.head = nn.Sequential(
+            Conv(self.chs, self.npr * 2, k=3, s=1, p=1),
+            C3k2(self.npr * 2, self.chs,),
+            nn.Conv2d(self.chs, nc, kernel_size=1, stride=1, padding=0)
+        )
+
+
+    def forward(self, x):
+        """Model forward function of semantic segment modular.
+
+        Args:
+            x(list): features from backbone or neck.
+
+        Returns:
+            mask(torch.Tensor): output for semantic segment task
+        """
+
+        out = self.head(x[0])
+        return out
