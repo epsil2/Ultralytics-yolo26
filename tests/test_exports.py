@@ -279,6 +279,7 @@ def test_export_paddle():
 
 @pytest.mark.slow
 @pytest.mark.skipif(not TORCH_1_10, reason="MNN export requires torch>=1.10")
+@pytest.mark.skipif(checks.IS_PYTHON_MINIMUM_3_13, reason="MNN export requires Python<3.13")
 def test_export_mnn():
     """Test YOLO export to MNN format (WARNING: MNN test must precede NCNN test or CI error on Windows)."""
     file = YOLO(MODEL).export(format="mnn", imgsz=32)
@@ -287,6 +288,7 @@ def test_export_mnn():
 
 @pytest.mark.slow
 @pytest.mark.skipif(not TORCH_1_10, reason="MNN export requires torch>=1.10")
+@pytest.mark.skipif(checks.IS_PYTHON_MINIMUM_3_13, reason="MNN export requires Python<3.13")
 @pytest.mark.parametrize(
     "task, int8, half, batch, end2end",
     [  # generate all combinations except for exclusion cases
@@ -321,7 +323,9 @@ def test_export_ncnn_matrix(task, half, batch):
 
 
 @pytest.mark.skipif(not TORCH_2_9, reason="IMX export requires torch>=2.9.0")
-@pytest.mark.skipif(not checks.IS_PYTHON_MINIMUM_3_9, reason="Requires Python>=3.9")
+@pytest.mark.skipif(
+    not checks.IS_PYTHON_MINIMUM_3_9 and checks.IS_PYTHON_MINIMUM_3_13, reason="Requires Python>=3.9,<3.13"
+)
 @pytest.mark.skipif(not LINUX, reason="IMX export only supported on Linux")
 @pytest.mark.skipif(
     IS_RASPBERRYPI, reason="Test disabled as IMX export suffers from OOM (Out of Memory) on Raspberry Pi 5 16GB"
