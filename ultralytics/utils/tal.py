@@ -172,6 +172,10 @@ class TaskAlignedAssigner(nn.Module):
     def get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
         """Compute alignment metric given predicted and ground truth bounding boxes.
 
+        On MPS, uses full-tensor computation to avoid variable-shape tensors that
+        multiply the MPS graph/MLIR/shader caches. On other devices, uses the original
+        boolean-indexed version.
+
         Args:
             pd_scores (torch.Tensor): Predicted classification scores with shape (bs, num_total_anchors, num_classes).
             pd_bboxes (torch.Tensor): Predicted bounding boxes with shape (bs, num_total_anchors, 4).
@@ -185,19 +189,25 @@ class TaskAlignedAssigner(nn.Module):
         """
         na = pd_bboxes.shape[-2]
         mask_gt = mask_gt.bool()  # b, max_num_obj, h*w
-        overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
-        bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
 
         ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)  # 2, b, max_num_obj
         ind[0] = torch.arange(end=self.bs).view(-1, 1).expand(-1, self.n_max_boxes)  # b, max_num_obj
         ind[1] = gt_labels.squeeze(-1)  # b, max_num_obj
-        # Get the scores of each grid for each gt cls
-        bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]  # b, max_num_obj, h*w
 
-        # (b, max_num_obj, 1, 4), (b, 1, h*w, 4)
-        pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
-        gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
-        overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
+        if pd_bboxes.device.type == "mps":
+            # MPS path: full-tensor computation, mask out invalid entries
+            bbox_scores = pd_scores[ind[0], :, ind[1]] * mask_gt  # b, max_num_obj, h*w
+            pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)
+            gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)
+            overlaps = self.iou_calculation(gt_boxes, pd_boxes) * mask_gt
+        else:
+            # Original path: boolean-indexed, pre-allocate zeros
+            overlaps = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_bboxes.dtype, device=pd_bboxes.device)
+            bbox_scores = torch.zeros([self.bs, self.n_max_boxes, na], dtype=pd_scores.dtype, device=pd_scores.device)
+            bbox_scores[mask_gt] = pd_scores[ind[0], :, ind[1]][mask_gt]
+            pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
+            gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
+            overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
 
         align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
         return align_metric, overlaps

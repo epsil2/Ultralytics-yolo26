@@ -112,6 +112,11 @@ class DetectionValidator(BaseValidator):
             (list[dict[str, torch.Tensor]]): Processed predictions after NMS, where each dict contains 'bboxes', 'conf',
                 'cls', and 'extra' tensors.
         """
+        # Move to CPU before NMS to avoid MPS graph cache pollution from variable-shape operations.
+        if isinstance(preds, torch.Tensor) and preds.device.type == "mps":
+            preds = preds.cpu()
+        elif isinstance(preds, (list, tuple)) and len(preds) and isinstance(preds[0], torch.Tensor) and preds[0].device.type == "mps":
+            preds = type(preds)(p.cpu() if isinstance(p, torch.Tensor) else p for p in preds)
         outputs = nms.non_max_suppression(
             preds,
             self.args.conf,
@@ -142,7 +147,7 @@ class DetectionValidator(BaseValidator):
         imgsz = batch["img"].shape[2:]
         ratio_pad = batch["ratio_pad"][si]
         if cls.shape[0]:
-            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=self.device)[[1, 0, 1, 0]]  # target boxes
+            bbox = ops.xywh2xyxy(bbox) * torch.tensor(imgsz, device=bbox.device)[[1, 0, 1, 0]]  # target boxes
         return {
             "cls": cls,
             "bboxes": bbox,
@@ -172,6 +177,11 @@ class DetectionValidator(BaseValidator):
             preds (list[dict[str, torch.Tensor]]): List of predictions from the model.
             batch (dict[str, Any]): Batch data containing ground truth.
         """
+        # Move annotation tensors to CPU to avoid MPS graph cache pollution from variable-shape boolean indexing in _prepare_batch and box_iou in _process_batch, this runs after model.loss() which needs them on device.
+        if batch.get("batch_idx") is not None and batch["batch_idx"].device.type == "mps":
+            for k in ("batch_idx", "cls", "bboxes"):
+                if k in batch and isinstance(batch[k], torch.Tensor):
+                    batch[k] = batch[k].cpu()
         for si, pred in enumerate(preds):
             self.seen += 1
             pbatch = self._prepare_batch(si, batch)

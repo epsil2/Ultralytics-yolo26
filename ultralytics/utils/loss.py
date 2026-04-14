@@ -126,16 +126,38 @@ class BboxLoss(nn.Module):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for bounding boxes."""
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        """Compute IoU and DFL losses for bounding boxes.
+
+        On MPS, uses full-tensor computation to avoid variable-shape tensors that
+        pollute the MPS graph/MLIR/shader caches. On other devices, uses the original
+        boolean-indexed version which is more memory-efficient.
+        """
+        if pred_bboxes.device.type == "mps":
+            # MPS path: full-tensor, weight masks out non-fg positions
+            weight = target_scores.sum(-1, keepdim=True)  # (B, A, 1)
+            iou = bbox_iou(pred_bboxes, target_bboxes, xywh=False, CIoU=True)  # (B, A, 1)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        else:
+            # Original path: boolean-indexed
+            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+            iou = bbox_iou(pred_bboxes[fg_mask], target_bboxes[fg_mask], xywh=False, CIoU=True)
+            loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
             target_ltrb = bbox2dist(anchor_points, target_bboxes, self.dfl_loss.reg_max - 1)
-            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
-            loss_dfl = loss_dfl.sum() / target_scores_sum
+            b, a, c = pred_dist.shape
+            if pred_bboxes.device.type == "mps":
+                weight_dfl = target_scores.sum(-1, keepdim=True)  # reuse full-tensor weight
+                loss_dfl = self.dfl_loss(
+                    pred_dist.view(-1, self.dfl_loss.reg_max), target_ltrb
+                ).view(b, a, -1) * weight_dfl  # (B, A, 1)
+                loss_dfl = loss_dfl.sum() / target_scores_sum
+            else:
+                loss_dfl = (
+                    self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask])
+                    * weight
+                ).sum() / target_scores_sum
         else:
             target_ltrb = bbox2dist(anchor_points, target_bboxes)
             # normalize ltrb by image size
@@ -145,9 +167,15 @@ class BboxLoss(nn.Module):
             pred_dist = pred_dist * stride
             pred_dist[..., 0::2] /= imgsz[1]
             pred_dist[..., 1::2] /= imgsz[0]
-            loss_dfl = (
-                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-            )
+            if pred_bboxes.device.type == "mps":
+                weight_dfl = target_scores.sum(-1, keepdim=True)
+                loss_dfl = (
+                    F.l1_loss(pred_dist, target_ltrb, reduction="none").mean(-1, keepdim=True) * weight_dfl
+                )
+            else:
+                loss_dfl = (
+                    F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+                )
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
         return loss_iou, loss_dfl
@@ -226,18 +254,40 @@ class RotatedBboxLoss(BboxLoss):
         imgsz: torch.Tensor,
         stride: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Compute IoU and DFL losses for rotated bounding boxes."""
-        weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
-        iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
-        loss_iou = ((1.0 - iou) * weight).sum() / target_scores_sum
+        """Compute IoU and DFL losses for rotated bounding boxes.
+
+        On MPS, uses full-tensor computation to avoid variable-shape tensors that
+        pollute the MPS graph/MLIR/shader caches. On other devices, uses the original
+        boolean-indexed version.
+        """
+        if pred_bboxes.device.type == "mps":
+            # MPS path: full-tensor
+            weight = target_scores.sum(-1, keepdim=True)  # (B, A, 1)
+            iou = probiou(pred_bboxes, target_bboxes)  # (B, A)
+            loss_iou = ((1.0 - iou).unsqueeze(-1) * weight).sum() / target_scores_sum
+        else:
+            # Original path: boolean-indexed
+            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+            iou = probiou(pred_bboxes[fg_mask], target_bboxes[fg_mask])
+            loss_iou = ((1.0 - iou).unsqueeze(-1) * weight).sum() / target_scores_sum
 
         # DFL loss
         if self.dfl_loss:
             target_ltrb = rbox2dist(
                 target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5], reg_max=self.dfl_loss.reg_max - 1
             )
-            loss_dfl = self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask]) * weight
-            loss_dfl = loss_dfl.sum() / target_scores_sum
+            b, a, c = pred_dist.shape
+            if pred_bboxes.device.type == "mps":
+                weight_dfl = target_scores.sum(-1, keepdim=True)
+                loss_dfl = self.dfl_loss(
+                    pred_dist.view(-1, self.dfl_loss.reg_max), target_ltrb
+                ).view(b, a, -1) * weight_dfl
+                loss_dfl = loss_dfl.sum() / target_scores_sum
+            else:
+                loss_dfl = (
+                    self.dfl_loss(pred_dist[fg_mask].view(-1, self.dfl_loss.reg_max), target_ltrb[fg_mask])
+                    * weight
+                ).sum() / target_scores_sum
         else:
             target_ltrb = rbox2dist(target_bboxes[..., :4], anchor_points, target_bboxes[..., 4:5])
             target_ltrb = target_ltrb * stride
@@ -246,9 +296,15 @@ class RotatedBboxLoss(BboxLoss):
             pred_dist = pred_dist * stride
             pred_dist[..., 0::2] /= imgsz[1]
             pred_dist[..., 1::2] /= imgsz[0]
-            loss_dfl = (
-                F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
-            )
+            if pred_bboxes.device.type == "mps":
+                weight_dfl = target_scores.sum(-1, keepdim=True)
+                loss_dfl = (
+                    F.l1_loss(pred_dist, target_ltrb, reduction="none").mean(-1, keepdim=True) * weight_dfl
+                )
+            else:
+                loss_dfl = (
+                    F.l1_loss(pred_dist[fg_mask], target_ltrb[fg_mask], reduction="none").mean(-1, keepdim=True) * weight
+                )
             loss_dfl = loss_dfl.sum() / target_scores_sum
 
         return loss_iou, loss_dfl
@@ -365,21 +421,46 @@ class v8DetectionLoss:
         self.bbox_loss = BboxLoss(m.reg_max).to(device)
         self.proj = torch.arange(m.reg_max, dtype=torch.float, device=device)
 
+    # In MPS, for the second dimension of the targets tensor in preprocess(, using a single constant eliminates all shape variation from the loss computation path, which otherwise causes unbounded memory growth via MPSGraphCache / MLIR BumpPtrAllocator / Metal shader caches (1 per shape!) — none of which can be flushed before process termination. Extra slots are zero-padded and masked by mask_gt.
+    # 512 should handle high after-mosaic-per-image ground truths.
+# it corresponds to the 'instances' indicator stat of training; a batch with an instances' count greater than that will create its own cache like before.
+    FIXED_MAX_BOXES = 512
+
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
-        """Preprocess targets by converting to tensor format and scaling coordinates."""
+        """Preprocess targets by converting to tensor format and scaling coordinates.
+
+        On MPS, all variable-shape scatter/index work runs on CPU to avoid multiplying
+        the MPS graph cache. On other devices, uses the original on-device path.
+        """
         nl, ne = targets.shape
         if nl == 0:
             out = torch.zeros(batch_size, 0, ne - 1, device=self.device)
-        else:
-            batch_idx = targets[:, 0].long()  # image index
+        elif self.device.type == "mps":
+            # MPS path: do scatter on CPU with fixed max_boxes
+            t = targets.cpu() if targets.device.type != "cpu" else targets
+            batch_idx = t[:, 0].long()
             _, counts = batch_idx.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), ne - 1, device=self.device)
-            offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+            max_boxes = max(self.FIXED_MAX_BOXES, int(counts.max()))
+            out_cpu = torch.zeros(batch_size, max_boxes, ne - 1)
+            offsets = torch.zeros(batch_size + 1, dtype=torch.long)
             offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
             offsets = offsets.cumsum(0)
-            within_idx = torch.arange(nl, device=self.device) - offsets[batch_idx]
-            out[batch_idx, within_idx] = targets[:, 1:]
+            within_idx = torch.arange(nl) - offsets[batch_idx]
+            out_cpu[batch_idx, within_idx] = t[:, 1:]
+            out = out_cpu.to(self.device)
+            out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
+        else:
+            # Original path: on-device scatter with dynamic counts.max()
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, int(counts.max()), ne - 1, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
             out[..., 1:5] = xywh2xyxy(out[..., 1:5].mul_(scale_tensor))
         return out
 
@@ -408,7 +489,10 @@ class v8DetectionLoss:
         imgsz = torch.tensor(preds["feats"][0].shape[2:], device=self.device, dtype=dtype) * self.stride[0]
 
         # Targets
-        targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+        if self.device.type == "mps":
+            targets = torch.cat((batch["batch_idx"].view(-1, 1).cpu(), batch["cls"].view(-1, 1).cpu(), batch["bboxes"].cpu()), 1)
+        else:
+            targets = torch.cat((batch["batch_idx"].view(-1, 1), batch["cls"].view(-1, 1), batch["bboxes"]), 1)
         targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
         gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
         mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
@@ -988,21 +1072,41 @@ class v8OBBLoss(v8DetectionLoss):
         self.bbox_loss = RotatedBboxLoss(self.reg_max).to(self.device)
 
     def preprocess(self, targets: torch.Tensor, batch_size: int, scale_tensor: torch.Tensor) -> torch.Tensor:
-        """Preprocess targets for oriented bounding box detection."""
+        """Preprocess targets for oriented bounding box detection.
+
+        On MPS, all variable-shape scatter/index work runs on CPU to avoid multiplying
+        the MPS graph cache. On other devices, uses the original on-device path.
+        """
         if targets.shape[0] == 0:
             out = torch.zeros(batch_size, 0, 6, device=self.device)
-        else:
-            batch_idx = targets[:, 0].long()  # image index
+        elif self.device.type == "mps":
+            # MPS path: do scatter on CPU with fixed max_boxes
+            t = targets.cpu() if targets.device.type != "cpu" else targets
+            batch_idx = t[:, 0].long()
             _, counts = batch_idx.unique(return_counts=True)
             counts = counts.to(dtype=torch.int32)
-            out = torch.zeros(batch_size, counts.max(), 6, device=self.device)
-            packed_targets = targets[:, 1:].clone()
-            packed_targets[:, 1:5].mul_(scale_tensor)
-            offsets = torch.zeros(batch_size + 1, dtype=torch.long, device=self.device)
+            max_boxes = max(self.FIXED_MAX_BOXES, int(counts.max()))
+            out_cpu = torch.zeros(batch_size, max_boxes, 6)
+            packed_targets = t[:, 1:].clone()
+            packed_targets[:, 1:5].mul_(scale_tensor.cpu())
+            offsets = torch.zeros(batch_size + 1, dtype=torch.long)
             offsets.scatter_add_(0, batch_idx + 1, torch.ones_like(batch_idx))
             offsets = offsets.cumsum(0)
-            within_idx = torch.arange(len(targets), device=self.device) - offsets[batch_idx]
-            out[batch_idx, within_idx] = packed_targets
+            within_idx = torch.arange(len(t)) - offsets[batch_idx]
+            out_cpu[batch_idx, within_idx] = packed_targets
+            out = out_cpu.to(self.device)
+        else:
+            # Original path: on-device scatter
+            i = targets[:, 0]  # image index
+            _, counts = i.unique(return_counts=True)
+            counts = counts.to(dtype=torch.int32)
+            out = torch.zeros(batch_size, int(counts.max()), 6, device=self.device)
+            for j in range(batch_size):
+                matches = i == j
+                n = matches.sum()
+                if n:
+                    out[j, :n] = targets[matches, 1:]
+            out[..., 1:5] *= scale_tensor
         return out
 
     def loss(self, preds: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
